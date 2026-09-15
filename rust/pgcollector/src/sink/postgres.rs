@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{Duration as CDuration, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio_postgres::types::ToSql;
 
 pub struct PostgresSink {
@@ -18,6 +18,10 @@ pub struct PostgresSink {
     retention_by_collector: BTreeMap<String, u32>,
     /// table → known columns, so we only hit the catalog when a new column shows up.
     schema_cache: Mutex<BTreeMap<String, HashSet<String>>>,
+    index_specs: Mutex<BTreeMap<String, Vec<Vec<String>>>>,
+    /// Tables with a partition index backfill in flight, so the hourly maintenance
+    /// does not start a second one.
+    backfilling: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Columns the sink owns. A collector row carrying one of these (e.g. `datname` from
@@ -80,6 +84,8 @@ impl PostgresSink {
             retention_days: cfg.retention_days,
             retention_by_collector: cfg.retention.clone(),
             schema_cache: Mutex::new(BTreeMap::new()),
+            index_specs: Mutex::new(BTreeMap::new()),
+            backfilling: Arc::new(Mutex::new(HashSet::new())),
         };
         sink.migrate().await?;
         sink.maintain().await?;
@@ -154,6 +160,9 @@ impl PostgresSink {
                 if !exists {
                     self.create_table(c, table, snap, &wanted).await?;
                 }
+                if snap.kind != Kind::Snapshot && !snap.indexes.is_empty() {
+                    self.ensure_indexes(c, table, &snap.indexes).await?;
+                }
                 let cols = c
                     .query(
                         "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
@@ -222,6 +231,51 @@ impl PostgresSink {
             self.ensure_partitions(c, table).await?;
         }
         Ok(())
+    }
+
+    /// Parent-only index: no build on existing partitions, which would hold a lock on
+    /// the table for the whole build. New partitions inherit it; old ones get theirs
+    /// concurrently in the background, and the parent turns valid once all are attached.
+    async fn ensure_indexes(
+        &self,
+        c: &deadpool_postgres::Client,
+        table: &str,
+        indexes: &[Vec<String>],
+    ) -> Result<()> {
+        for cols in indexes {
+            c.batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtext('pgcollector:{table}')); \
+                 CREATE INDEX IF NOT EXISTS {} ON ONLY {table} ({}); COMMIT;",
+                index_name(table, cols),
+                index_cols(cols)
+            ))
+            .await
+            .with_context(|| format!("indexing {table}"))?;
+        }
+        self.index_specs
+            .lock()
+            .unwrap()
+            .insert(table.to_string(), indexes.to_vec());
+        self.backfill_partition_indexes(table, indexes);
+        Ok(())
+    }
+
+    /// Background, because a `CONCURRENTLY` build of a large partition takes minutes.
+    /// One task per table: two concurrent builds on the same partition deadlock.
+    fn backfill_partition_indexes(&self, table: &str, indexes: &[Vec<String>]) {
+        if !self.backfilling.lock().unwrap().insert(table.to_string()) {
+            return;
+        }
+        let (pool, backfilling) = (self.pool.clone(), self.backfilling.clone());
+        let (table, indexes) = (table.to_string(), indexes.to_vec());
+        tokio::spawn(async move {
+            for cols in &indexes {
+                if let Err(e) = attach_partition_indexes(&pool, &table, cols).await {
+                    tracing::warn!(index = index_name(&table, cols), error = %format!("{e:#}"), "partition index backfill failed");
+                }
+            }
+            backfilling.lock().unwrap().remove(&table);
+        });
     }
 
     async fn ensure_partitions(&self, c: &deadpool_postgres::Client, table: &str) -> Result<()> {
@@ -474,8 +528,57 @@ impl Sink for PostgresSink {
                 }
             }
         }
+        let specs = self.index_specs.lock().unwrap().clone();
+        for (table, indexes) in &specs {
+            self.backfill_partition_indexes(table, indexes);
+        }
         Ok(())
     }
+}
+
+async fn attach_partition_indexes(pool: &Pool, table: &str, cols: &[String]) -> Result<()> {
+    let c = pool.get().await?;
+    let parent = index_name(table, cols);
+    let missing = c
+        .query(
+            "SELECT p.inhrelid::regclass::text FROM pg_inherits p \
+             WHERE p.inhparent = $1::text::regclass AND NOT EXISTS ( \
+               SELECT 1 FROM pg_inherits i JOIN pg_index x ON x.indexrelid = i.inhrelid \
+               WHERE i.inhparent = $2::text::regclass AND x.indrelid = p.inhrelid) \
+             ORDER BY 1 DESC",
+            &[&table, &parent],
+        )
+        .await?;
+    for row in missing {
+        let part: String = row.get(0);
+        let child = index_name(&part, cols);
+        tracing::info!(partition = part, index = child, "building partition index");
+        // A build that failed part-way leaves an invalid index under this name.
+        c.batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {child}"))
+            .await?;
+        c.batch_execute(&format!(
+            "CREATE INDEX CONCURRENTLY {child} ON {part} ({})",
+            index_cols(cols)
+        ))
+        .await
+        .with_context(|| format!("building {child}"))?;
+        c.batch_execute(&format!("ALTER INDEX {parent} ATTACH PARTITION {child}"))
+            .await?;
+    }
+    Ok(())
+}
+
+fn index_name(table: &str, cols: &[String]) -> String {
+    format!("{table}_{}_idx", cols.join("_"))
+}
+
+fn index_cols(cols: &[String]) -> String {
+    std::iter::once("server_id")
+        .chain(cols.iter().map(String::as_str))
+        .chain(std::iter::once("collected_at"))
+        .map(q)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn q(ident: &str) -> String {
