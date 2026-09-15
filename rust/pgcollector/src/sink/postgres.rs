@@ -15,6 +15,7 @@ use tokio_postgres::types::ToSql;
 pub struct PostgresSink {
     pool: Pool,
     retention_days: u32,
+    retention_by_collector: BTreeMap<String, u32>,
     /// table → known columns, so we only hit the catalog when a new column shows up.
     schema_cache: Mutex<BTreeMap<String, HashSet<String>>>,
 }
@@ -77,6 +78,7 @@ impl PostgresSink {
         let sink = Self {
             pool,
             retention_days: cfg.retention_days,
+            retention_by_collector: cfg.retention.clone(),
             schema_cache: Mutex::new(BTreeMap::new()),
         };
         sink.migrate().await?;
@@ -444,10 +446,16 @@ impl Sink for PostgresSink {
             .into_iter()
             .map(|r| r.get(0))
             .collect();
-        let cutoff = (Utc::now().date_naive() - CDuration::days(self.retention_days as i64))
-            .format("%Y%m%d")
-            .to_string();
+        let today = Utc::now().date_naive();
         for t in &tables {
+            let days = t
+                .strip_prefix("ts_")
+                .and_then(|name| self.retention_by_collector.get(name))
+                .copied()
+                .unwrap_or(self.retention_days);
+            let cutoff = (today - CDuration::days(days as i64))
+                .format("%Y%m%d")
+                .to_string();
             self.ensure_partitions(&c, t).await?;
             let parts = c
                 .query(
